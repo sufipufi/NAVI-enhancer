@@ -51,17 +51,68 @@ settings = {
     "cursor_sway": False,    # moves the cursor in circles
 }
 
-# Cursor sway tuning: it glides in a straight line to a random spot, rests, then repeats
-SWAY_RANGE = 250                  # farthest it wanders from where it started, in pixels
-SWAY_SPEED_RANGE = (400, 1200)    # pixels per second during a move (random each time)
-SWAY_PAUSE_RANGE = (0.3, 1.2)     # seconds it rests between moves (random each time)
+# Cursor sway tuning: it moves like a hand would, in curved paths with a little shake,
+# sometimes overshoots and corrects, and rests for uneven amounts of time
+SWAY_RANGE = 250                    # farthest it wanders from where it started, in pixels
+SWAY_SPEED_RANGE = (350, 1100)      # pixels per second for a move (random each time)
+SWAY_BEND = 0.22                    # how much paths curve (0 = straight line, 0.3 = very curvy)
+SWAY_TREMOR = 1.2                   # size of the tiny hand shake, in pixels (0 turns it off)
+SWAY_OVERSHOOT_CHANCE = 0.35        # chance a long move goes slightly past the target and corrects
+SWAY_PAUSE_RANGE = (0.3, 1.2)       # normal rest between moves, in seconds
+SWAY_LONG_PAUSE_CHANCE = 0.15       # sometimes it rests longer, like the person got distracted
+SWAY_LONG_PAUSE_RANGE = (1.5, 3.5)
 
-def new_sway_move(cur):
-    # Picks a random spot (relative to where the sway started) and how long the trip takes
-    target = (random.randint(-SWAY_RANGE, SWAY_RANGE), random.randint(-SWAY_RANGE, SWAY_RANGE))
-    dist = math.hypot(target[0] - cur[0], target[1] - cur[1])
-    duration = max(dist / random.uniform(*SWAY_SPEED_RANGE), 0.15)
-    return target, duration
+def new_sway_move(cur, target, speed=None, bend=None):
+    # Builds one move: a curved path (cubic bezier) with its own bend, speed, skew and hand shake
+    speed = speed or SWAY_SPEED_RANGE
+    bend = SWAY_BEND if bend is None else bend
+    dx, dy = target[0] - cur[0], target[1] - cur[1]
+    dist = max(math.hypot(dx, dy), 1.0)
+    nx, ny = -dy / dist, dx / dist   # the sideways direction, used to bend the path
+    b1 = random.uniform(-bend, bend) * dist
+    b2 = random.uniform(-bend, bend) * dist
+    c1 = (cur[0] + dx * 0.3 + nx * b1, cur[1] + dy * 0.3 + ny * b1)
+    c2 = (cur[0] + dx * 0.7 + nx * b2, cur[1] + dy * 0.7 + ny * b2)
+    shake = lambda: [(random.uniform(5, 12), random.uniform(0, 2 * math.pi),
+                      random.uniform(0.3, 1.0) * SWAY_TREMOR) for _ in range(3)]
+    return {
+        "p0": cur, "c1": c1, "c2": c2, "p3": target,
+        "dur": max(dist / random.uniform(*speed), 0.12),
+        "skew": random.uniform(0.85, 1.25),   # makes the speed uneven: quicker start or slower finish
+        "shake_x": shake(), "shake_y": shake(),
+    }
+
+def new_sway_plan(cur):
+    # Picks the next random spot. Long moves sometimes overshoot, then take a small slow correction.
+    r = SWAY_RANGE
+    target = (random.randint(-r, r), random.randint(-r, r))
+    dx, dy = target[0] - cur[0], target[1] - cur[1]
+    dist = math.hypot(dx, dy)
+    if dist > 80 and random.random() < SWAY_OVERSHOOT_CHANCE:
+        o = random.uniform(5, 15)
+        over = (target[0] + dx / dist * o, target[1] + dy / dist * o)
+        return [new_sway_move(cur, over), new_sway_move(over, target, speed=(60, 160), bend=0.05)]
+    return [new_sway_move(cur, target)]
+
+def sway_pause():
+    if random.random() < SWAY_LONG_PAUSE_CHANCE:
+        return random.uniform(*SWAY_LONG_PAUSE_RANGE)
+    return random.uniform(*SWAY_PAUSE_RANGE)
+
+def sway_point(m, elapsed):
+    # Where the cursor should be, "elapsed" seconds into move m
+    t = min(elapsed / m["dur"], 1.0)
+    t = t ** m["skew"]
+    e = t ** 3 * (10 - 15 * t + 6 * t * t)   # minimum-jerk curve: gentle start and stop, fast middle
+    u = 1 - e
+    (x0, y0), (x1, y1), (x2, y2), (x3, y3) = m["p0"], m["c1"], m["c2"], m["p3"]
+    x = u**3 * x0 + 3 * u * u * e * x1 + 3 * u * e * e * x2 + e**3 * x3
+    y = u**3 * y0 + 3 * u * u * e * y1 + 3 * u * e * e * y2 + e**3 * y3
+    # hand shake fades to zero at both ends so the move still lands exactly on target
+    env = math.sin(math.pi * min(elapsed / m["dur"], 1.0))
+    x += env * sum(a * math.sin(2 * math.pi * f * elapsed + ph) for f, ph, a in m["shake_x"])
+    y += env * sum(a * math.sin(2 * math.pi * f * elapsed + ph) for f, ph, a in m["shake_y"])
+    return x, y
 
 # Keys that aren't plain characters need to map to a pynput Key object.
 # Add more here later, e.g. "shift": keyboard.Key.shift
@@ -100,10 +151,9 @@ def worker():
     last_click = 0
     click_wait = next_interval()   # current gap before the next auto click
     sway_off = None   # how far the sway has pushed the cursor from where it started
-    sway_from = (0, 0)    # where the current straight-line move started
-    sway_to = (0, 0)      # where it's heading
+    sway_plan = []        # moves queued up: the main move, sometimes a small correction after it
+    sway_move = None      # the move being performed right now
     sway_t0 = 0           # when the current move started
-    sway_dur = 1.0        # how long the current move takes
     sway_rest_until = 0   # while now < this, the cursor sits still
     while True:
         # Undo the sway offset when it's turned off or automation stops,
@@ -123,24 +173,28 @@ def worker():
             if settings["cursor_sway"]:
                 if sway_off is None:
                     sway_off = (0, 0)
-                    sway_from = (0, 0)
-                    sway_to, sway_dur = new_sway_move(sway_from)
+                    sway_plan = new_sway_plan((0, 0))
+                    sway_move = sway_plan.pop(0)
                     sway_t0 = now
                     sway_rest_until = 0
                 if now >= sway_rest_until:   # only move when not resting
-                    t = min((now - sway_t0) / sway_dur, 1.0)
-                    e = t * t * (3 - 2 * t)   # eases in and out, but the path stays a straight line
-                    new_off = (round(sway_from[0] + (sway_to[0] - sway_from[0]) * e),
-                               round(sway_from[1] + (sway_to[1] - sway_from[1]) * e))
+                    elapsed = now - sway_t0
+                    x, y = sway_point(sway_move, elapsed)
+                    new_off = (round(x), round(y))
                     dx, dy = new_off[0] - sway_off[0], new_off[1] - sway_off[1]
                     if dx or dy:
                         mouse.move(dx, dy)   # relative move, so you can still nudge the mouse yourself
                     sway_off = new_off
-                    if t >= 1.0:
-                        # Arrived: rest for a random moment, then pick the next random spot
-                        sway_from = sway_to
-                        sway_rest_until = now + random.uniform(*SWAY_PAUSE_RANGE)
-                        sway_to, sway_dur = new_sway_move(sway_from)
+                    if elapsed >= sway_move["dur"]:
+                        # Arrived. Either do the queued correction after a tiny hesitation,
+                        # or rest for a random while and plan the next random move.
+                        if sway_plan:
+                            rest = random.uniform(0.04, 0.14)
+                        else:
+                            rest = sway_pause()
+                            sway_plan = new_sway_plan(sway_move["p3"])
+                        sway_rest_until = now + rest
+                        sway_move = sway_plan.pop(0)
                         sway_t0 = sway_rest_until
 
             if settings["key"] != "none" and now - last_main >= wait:
