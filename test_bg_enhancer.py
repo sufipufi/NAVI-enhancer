@@ -27,18 +27,37 @@ WDA_NONE = 0x00000000
 WDA_MONITOR = 0x00000001              # captured as a black box
 WDA_EXCLUDEFROMCAPTURE = 0x00000011   # fully invisible to capture (Win 10 2004+)
 
-user32 = ctypes.windll.user32
+user32 = ctypes.WinDLL("user32", use_last_error=True)   # use_last_error lets us read why a call failed
 user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
 user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
+user32.GetWindowDisplayAffinity.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+user32.GetWindowDisplayAffinity.restype = wintypes.BOOL
 user32.GetParent.argtypes = [wintypes.HWND]
 user32.GetParent.restype = wintypes.HWND
+user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+user32.GetAncestor.restype = wintypes.HWND
+GA_ROOT = 2
 
-def protect_window(tk_window):
-    # Tk's winfo_id() is an inner child window; its parent is the real top-level HWND
-    child = tk_window.winfo_id()
-    hwnd = user32.GetParent(child) or child
-    if not user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE):
-        user32.SetWindowDisplayAffinity(hwnd, WDA_MONITOR)  # fallback for older Windows
+def protect_window(tk_window, verbose=True):
+    # Hides a Tk window from screenshots and screen recordings.
+    # Tk's winfo_id() is an inner child window, so try the real top-level handle first,
+    # then read the setting back to confirm Windows actually accepted it.
+    tk_window.update_idletasks()
+    inner = tk_window.winfo_id()
+    candidates = []
+    for h in (user32.GetAncestor(inner, GA_ROOT), user32.GetParent(inner), inner):
+        if h and h not in candidates:
+            candidates.append(h)
+    for hwnd in candidates:
+        for flag in (WDA_EXCLUDEFROMCAPTURE, WDA_MONITOR):   # strongest first, older Windows fallback
+            if user32.SetWindowDisplayAffinity(hwnd, flag):
+                got = wintypes.DWORD(0)
+                user32.GetWindowDisplayAffinity(hwnd, ctypes.byref(got))
+                if verbose:
+                    print(f"[capture protection] ON  hwnd={hwnd:#x} flag={flag:#x} readback={got.value:#x}")
+                return got.value == flag
+            print(f"[capture protection] FAILED hwnd={hwnd:#x} flag={flag:#x} error={ctypes.get_last_error()}")
+    return False
 
 # Live settings, read by the background thread and updated by the GUI
 settings = {
@@ -230,7 +249,7 @@ RED_HOVER = "#e14b4b"
 FONT = ("Segoe UI", 10)
 FONT_BOLD = ("Segoe UI Semibold", 10)
 FONT_TITLE = ("Segoe UI Semibold", 12)
-FONT_TIMER = ("Segoe UI Semibold", 20)   # bigger timer font
+FONT_TIMER = ("Segoe UI Semibold", 20)   # bigger timer font lol
 
 TOGGLE_OFF = "#4a4f5c"     # grey track when off
 TOGGLE_ON = "#0a84ff"      # blue track when on
@@ -516,7 +535,7 @@ class ModernDropdown(tk.Canvas):
 
     def hide_popup_from_capture(self, top):
         try:
-            protect_window(top)   # same screen-capture protection as the main panel
+            protect_window(top, verbose=False)   # same screen-capture protection as the main panel
         except tk.TclError:
             pass
 
@@ -666,6 +685,8 @@ class Panel(tk.Toplevel):
         self.attributes("-alpha", min(step, 0.93))
         if step < 0.93:
             self.after(15, lambda: self.fade_in(step))
+        else:
+            protect_window(self, verbose=False)   # re-apply now that the fade is done
 
     def make_toggle(self, parent, text, var, on_change):
         # Builds one row: label on the left, slider switch on the right
@@ -747,6 +768,7 @@ def toggle_panel():
         panel.update_status()   # refresh button/dot/timer before showing
         panel.deiconify()
         panel.lift()
+        panel.after(50, lambda: protect_window(panel, verbose=False))
     else:
         panel.withdraw()
 
